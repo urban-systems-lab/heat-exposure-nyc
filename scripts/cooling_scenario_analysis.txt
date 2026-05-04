@@ -1,0 +1,165 @@
+"""
+Cooling Scenario Analysis Script
+
+This script recomputes trip-level UTCI exposure and segment-level usage counts
+using cooled street-network UTCI data.
+
+Inputs:
+- merged_routes_neat_*.gpkg (routed Citi Bike trips)
+- street_segments_utci_neat_*.gpkg (cooled hourly UTCI networks)
+
+Outputs:
+- mean_utci_*.csv (trip-level exposure)
+- street_network_with_counts.gpkg (segment-level counts)
+
+This script is used after generating cooled street networks in the notebook:
+cooling_scenario.ipynb
+"""
+
+
+import pandas as pd
+import geopandas as gpd
+import gc
+from pyproj import Geod
+from pathlib import Path
+
+# Geod for geodesic calculations
+geod = Geod(ellps="WGS84")
+
+# === USER-ADJUST PATHS (UPDATED FOR TOP-1000) ===
+ROUTES_DIR      = Path(r"C:\Users\Agustin\Documents\2025summer\sanity_check\results")
+COOLED_SEG_DIR  = Path(r"C:\Users\Agustin\Documents\2025summer\sanity_check\cooling_scenario\top1000\3degrees\results")
+UTCI_CSV_DIR    = Path(r"C:\Users\Agustin\Documents\2025summer\sanity_check\cooling_scenario\top1000\3degrees\utci_results")
+OUT_NETWORK_DIR = Path(r"C:\Users\Agustin\Documents\2025summer\sanity_check\cooling_scenario\top1000\3degrees\results")
+
+# Make sure output folders exist
+UTCI_CSV_DIR.mkdir(parents=True, exist_ok=True)
+OUT_NETWORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parameters (same as base scenario)
+BUF       = 3       # buffer distance (m)
+MIN_LEN   = 5       # minimum overlap length (m)
+MIN_RATIO = 0.20    # minimum overlap fraction
+HOT       = 32.0    # UTCI hot threshold
+
+# Initialize global counter
+usage_global = pd.Series(dtype="int", name="count")
+usage_global.index.name = "seg_id"
+
+# Helper: geodesic length of a geometry
+def geodesic_length(line):
+    if line.geom_type == "MultiLineString":
+        segments = line.geoms
+    else:
+        segments = [line]
+    length = 0.0
+    for seg in segments:
+        lons, lats = zip(*seg.coords)
+        length += sum(geod.line_lengths(lons, lats))
+    return length
+
+# Process each hour
+for hh in range(24):
+    hour_str = f"{hh:02d}00"
+    print(f"\n── Hour {hour_str} ──")
+
+    # 1) Load merged routes
+    routes_fp = ROUTES_DIR / f"merged_routes_neat_{hour_str}.gpkg"
+    if not routes_fp.exists():
+        print(f"   · missing routes for {hour_str}, skipping")
+        continue
+    routes = gpd.read_file(routes_fp).to_crs(32118)
+    if routes.empty:
+        print("   · no trips for this hour, skipping")
+        continue
+    if "ride_id" not in routes.columns:
+        routes["ride_id"] = routes.index.astype(str)
+
+    # 2) Compute trip lengths
+    routes["trip_len_m"] = routes.geometry.apply(geodesic_length)
+    routes_proj = routes  # already in 32118
+
+    # 3) Load cooled-down UTCI segments
+    seg_fp = COOLED_SEG_DIR / f"street_segments_utci_neat_{hh:02d}.gpkg"
+    if not seg_fp.exists():
+        print(f"   · missing cooled UTCI file for {hour_str}, skipping")
+        continue
+    streets = (
+        gpd.read_file(seg_fp)
+           .set_index("seg_id")[["geometry","utci"]]
+           .to_crs(32118)
+    )
+    streets["seg_len"] = streets.geometry.length
+
+    # 4) Buffer & spatial join for counts (AND-logic)
+    buf = routes_proj.geometry.buffer(BUF, cap_style=2)
+    cand = (
+        gpd.sjoin(
+            gpd.GeoDataFrame({"geometry": buf}, crs=32118),
+            streets[["geometry"]],
+            how="inner",
+            predicate="intersects"
+        )
+        .rename(columns={"index_right": "seg_id"})
+        .reset_index(drop=True)
+    )
+    def qualifies(r):
+        inter_len = streets.geometry[r.seg_id].intersection(r.geometry).length
+        return (inter_len >= MIN_LEN) and (inter_len / streets.seg_len[r.seg_id] >= MIN_RATIO)
+    valid = cand[cand.apply(qualifies, axis=1)]
+    usage_hr = valid.seg_id.value_counts().rename("count")
+    hot_segs = streets[streets.utci >= HOT].index
+    usage_hr_hot = usage_hr[usage_hr.index.isin(hot_segs)].astype(int)
+    usage_global = usage_global.add(usage_hr_hot, fill_value=0)
+
+    # 5) Generate per-trip mean UTCI CSV
+    joined = gpd.sjoin(
+        gpd.GeoDataFrame({
+            "ride_id":    routes.ride_id,
+            "trip_len_m": routes.trip_len_m,
+            "geometry":   routes_proj.geometry
+        }, crs=32118),
+        streets[["geometry","utci","seg_len"]],
+        how="inner",
+        predicate="intersects"
+    )
+    if not joined.empty:
+        def trip_stats(grp):
+            return pd.Series({
+                "ride_id":    grp.name,
+                "trip_len_m": grp["trip_len_m"].iloc[0],
+                "mean_utci":  (grp.seg_len * grp.utci).sum() / grp.seg_len.sum()
+            })
+        agg = joined.groupby("ride_id", sort=False).apply(trip_stats).reset_index(drop=True)
+        agg["hour"] = hh
+    else:
+        agg = pd.DataFrame(columns=["ride_id","trip_len_m","mean_utci","hour"])
+
+    # —— ROUND mean_utci to eliminate FP noise (4 decimals):
+    agg["mean_utci"] = agg["mean_utci"].round(4)
+
+    csv_fp = UTCI_CSV_DIR / f"mean_utci_{hour_str}.csv"
+    agg.to_csv(csv_fp, index=False)
+    print(f"   → saved CSV: {csv_fp} ({len(agg)} records)")
+
+    # Cleanup
+    del routes, streets, buf, cand, valid, usage_hr, usage_hr_hot, joined, agg
+    gc.collect()
+
+# ─── WRITE STREET NETWORK WITH CUMULATIVE COUNTS ───────────────────────
+print("\n🏁 Building cooled street_network_with_counts…")
+seg_files = sorted(COOLED_SEG_DIR.glob("street_segments_utci_neat_*.gpkg"))
+if not seg_files:
+    raise FileNotFoundError("No cooled UTCI segment files found!")
+base_fp = seg_files[0]
+
+streets_base = (
+    gpd.read_file(base_fp)[["seg_id","geometry","utci"]]
+       .set_index("seg_id")
+       .to_crs(32118)
+)
+streets_base["count"] = usage_global.reindex(streets_base.index).fillna(0).astype(int)
+
+network_fp = OUT_NETWORK_DIR / "street_network_with_counts.gpkg"
+streets_base.to_file(network_fp, driver="GPKG")
+print(f"✔ Wrote cooled street_network_with_counts to: {network_fp}")

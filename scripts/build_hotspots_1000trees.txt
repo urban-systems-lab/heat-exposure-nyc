@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+
+import geopandas as gpd
+import pandas as pd
+import gc
+from pathlib import Path
+
+# ─── CONFIG ───────────────────────────────────────────────────────────
+# Where the per-hour segment GPKGs live (from Step 6) AND where outputs go
+WORK_DIR   = Path(r"C:\Users\Agustin\Documents\2025summer\trees\top1000\results")
+
+# Where the merged per-hour routes live
+ROUTES_DIR = Path(r"C:\Users\Agustin\Documents\2025summer\sanity_check\results")
+
+# Per-hour UTCI-segment files are in WORK_DIR (e.g., street_segments_utci_neat_13.gpkg)
+UTCI_DIR   = WORK_DIR
+
+# Output directory — same as WORK_DIR in this case
+OUT_DIR    = Path(r"C:\Users\Agustin\Documents\2025summer\trees\top1000\results")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+BUF       = 3       # buffer distance (m)
+MIN_LEN   = 5       # minimum overlap length (m)
+MIN_RATIO = 0.20    # minimum overlap fraction
+HOT       = 32.0    # UTCI hot threshold
+
+# ─── PER-HOUR TOP-100 GENERATION & GLOBAL COUNT ACCUMULATION ───────────
+usage_global = pd.Series(dtype="int", name="count")
+usage_global.index.name = "seg_id"
+
+for hh in range(24):
+    hr = f"{hh:02d}00"
+    print(f"\n👉 Starting hour {hr}…")
+
+    routes_fp = ROUTES_DIR / f"merged_routes_neat_{hr}.gpkg"
+    seg_fp    = UTCI_DIR   / f"street_segments_utci_neat_{hh:02d}.gpkg"
+    if not routes_fp.exists() or not seg_fp.exists():
+        print(f"  → Missing files for {hr}, skipping.")
+        continue
+
+    # 1) Load routed trips & UTCI segments
+    routes  = gpd.read_file(routes_fp).to_crs(32118)
+    streets = (
+        gpd.read_file(seg_fp)
+           .set_index("seg_id")[["geometry","utci"]]
+           .to_crs(32118)
+    )
+    streets["seg_len"] = streets.geometry.length
+
+    # 2) Buffer routes & spatial-join to segments
+    buf = routes.geometry.buffer(BUF, cap_style=2)
+    cand = gpd.sjoin(
+        gpd.GeoDataFrame({"geometry": buf}, crs=32118),
+        streets[["geometry"]],
+        how="inner", predicate="intersects"
+    ).rename(columns={"index_right":"seg_id"}).reset_index(drop=True)
+
+    # 3) AND-logic filter
+    def qualifies(r):
+        inter_len = streets.geometry[r.seg_id].intersection(r.geometry).length
+        return (inter_len >= MIN_LEN) and (inter_len / streets.seg_len[r.seg_id] >= MIN_RATIO)
+
+    valid    = cand[cand.apply(qualifies, axis=1)]
+    usage_hr = valid.seg_id.value_counts().rename("count")
+
+    # 4) Write this hour’s top-100 GPkg
+    hot_segs = streets[streets.utci >= HOT].index
+    usage_hr_hot = usage_hr[usage_hr.index.isin(hot_segs)].astype(int)
+
+    seg_use = streets.join(usage_hr_hot.rename("count"), how="left").fillna(0)
+    seg_use["count"] = seg_use["count"].astype(int)
+    top100 = seg_use[seg_use.utci >= HOT].nlargest(100, "count")
+
+    out_fp = OUT_DIR / f"top100_high_utci_segments_neat_{hr}.gpkg"
+    top100.to_file(out_fp, driver="GPKG")
+    print(f"  ✅ Wrote hourly top-100: {out_fp}")
+
+    # 5) Accumulate into global counter
+    usage_global = usage_global.add(usage_hr_hot, fill_value=0)
+
+    # 6) Clean up memory
+    del routes, streets, buf, cand, valid, usage_hr, usage_hr_hot, seg_use, top100
+    gc.collect()
+
+# ─── WRITE STREET NETWORK WITH CUMULATIVE COUNTS ───────────────────────
+print("\n🏁 Building full street network with counts…")
+
+# pick any UTCI file to get the full network geometry & utci
+seg_files = sorted(UTCI_DIR.glob("street_segments_utci_neat_*.gpkg"))
+if not seg_files:
+    raise FileNotFoundError("No UTCI segment files found!")
+base_fp = seg_files[0]
+
+streets_base = (
+    gpd.read_file(base_fp)
+       [["seg_id","geometry","utci"]]
+       .set_index("seg_id")
+       .to_crs(32118)
+)
+streets_base["count"] = usage_global.reindex(streets_base.index).fillna(0).astype(int)
+
+network_fp = OUT_DIR / "street_network_1000trees_with_counts.gpkg"
+streets_base.to_file(network_fp, driver="GPKG")
+print("✔ Street network with counts written to:", network_fp)
+
+# ─── GLOBAL TOP-100 GENERATION ────────────────────────────────────────
+print("\n🌍 Computing global top-100…")
+
+# compute max UTCI per segment across all hours
+max_utci = pd.Series(dtype="float64")
+for seg_fp in seg_files:
+    s_utci = gpd.read_file(seg_fp).set_index("seg_id")["utci"]
+    max_utci = max_utci.combine(s_utci, max, fill_value=0)
+streets_base["max_utci"] = max_utci.reindex(streets_base.index).fillna(0)
+
+top100_day = (
+    streets_base
+      .query("max_utci >= @HOT and count > 0")
+      .nlargest(100, "count")
+)
+global_fp = OUT_DIR / "top100_high_utci_segments_neat_GLOBAL.gpkg"
+top100_day.to_file(global_fp, driver="GPKG")
+print("✔ Global top-100 written to:", global_fp)
