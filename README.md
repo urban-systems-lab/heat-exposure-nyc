@@ -8,9 +8,9 @@ This repository contains analysis code accompanying the manuscript:
 
 This work couples high-resolution urban microclimate modeling (WRF–BEP–SOLWEIG) with city-scale bicycle mobility data from the Citi Bike system to quantify mobility-weighted heat exposure across the New York City street network during the June 2024 heatwave. We identify a network-level concentration mechanism whereby a small fraction of street segments accounts for a disproportionate share of total heat-exposed travel, and evaluate the cooling efficiency of targeted tree-planting interventions.
 
-## Repository status
+## Repository contents
 
-This repository is being populated with the analysis code over the coming days. For early access, questions, or replication requests, please contact the corresponding author at m.schlaepfer@columbia.edu.
+This repository contains the trip routing pipeline, exposure quantification code, and analysis scripts. Documentation of each notebook is provided in the accompanying PDF. WRF–BEP and SOLWEIG model configurations are described in the Methods section and Supplementary Materials of the manuscript. For questions or replication requests, please contact the corresponding author at m.schlaepfer@columbia.edu.
 
 ## Data sources
 
