@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# data & routing artifacts (never commit these)
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.tif
+*.pbf
+*.osm
+*.zip
+tiles/
