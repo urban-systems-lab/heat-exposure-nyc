@@ -1,0 +1,25 @@
+name: heat-exposure-nyc
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - geopandas>=0.14
+  - shapely>=2.0
+  - fiona
+  - pyproj
+  - rtree            # required for sjoin_nearest
+  - networkx>=3.0    # perceived-distance routing
+  - numpy
+  - pandas
+  - scipy            # cKDTree station snapping
+  - xarray
+  - rasterio
+  - rasterstats      # zonal_stats in verified_hotspot_analysis
+  - osmnx
+  - matplotlib
+  - jupyterlab
+  - pip
+  - pip:
+      - polyline     # only needed for the legacy Valhalla path
+      - neatnet      # only needed to regenerate the simplified network
